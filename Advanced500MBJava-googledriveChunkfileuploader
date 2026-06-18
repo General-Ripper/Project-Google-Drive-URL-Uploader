@@ -10,7 +10,8 @@ function startUpload() {
       metadata: { name: fileName, mimeType: "application/zip" }
     }
   });
-  
+
+
   const result = uploader.run();
   Logger.log(result);
   return result;
