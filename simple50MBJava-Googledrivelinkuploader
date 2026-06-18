@@ -14,3 +14,4 @@ function downloadBrowserCookie() {
     Logger.log("❌ Error: " + e.toString());
   }
 }
+
