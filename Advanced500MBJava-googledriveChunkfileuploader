@@ -1,0 +1,152 @@
+// The main function to run
+function startUpload() {
+  const fileUrl = ""; // File URL
+  const fileName = ""; // Name your file
+
+  const uploader = new UploadApp({
+    source: { url: fileUrl },
+    destination: {
+      uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
+      metadata: { name: fileName, mimeType: "application/zip" }
+    }
+  });
+  
+  const result = uploader.run();
+  Logger.log(result);
+  return result;
+}
+
+// --------------------------------------------------------------------
+// UploadApp Class
+// Handles resumable uploads and works around the 50MB limit
+// Source: https://github.com/tanaikech/UploadApp With a shitload of Si' Edits
+// --------------------------------------------------------------------
+class UploadApp {
+  constructor(object = {}) {
+    this.property = PropertiesService.getScriptProperties();
+    const next = this.property.getProperty("next");
+    if (!next && (!object.source || (!object.source.fileId && !object.source.url))) {
+      throw new Error("Please set a valid object.");
+    } else if (next) {
+      this.tempObject = JSON.parse(next);
+      this.current = this.tempObject.next;
+      this.tempObject.next = 0;
+      if (this.tempObject.result) delete this.tempObject.result;
+    } else {
+      this.current = 0;
+      this.tempObject = { orgObject: { ...object } };
+    }
+    if (this.tempObject.orgObject.source.fileId) {
+      this.googleDrive = true;
+      this.fileGet = `https://www.googleapis.com/drive/v3/files/${this.tempObject.orgObject.source.fileId}?supportsAllDrives=true`;
+      this.downloadUrl = `${this.fileGet}&alt=media`;
+    } else {
+      this.googleDrive = false;
+      this.downloadUrl = this.tempObject.orgObject.source.url;
+    }
+    this.startTime = Date.now();
+    this.limitProcessTime = 300 * 1000; // 5 minutes
+    this.authorization = `Bearer ${this.tempObject.orgObject.accessToken || ScriptApp.getOAuthToken()}`;
+    this.chunkSize = 16777216; // 16 MB chunk size
+  }
+
+  run() {
+    if (this.current == 0) {
+      this.getMetadata_();
+      this.getChunks_();
+      this.getLocation_();
+    }
+    this.downloadAndUpload_();
+    return this.tempObject.result;
+  }
+
+  getMetadata_() {
+    if (this.googleDrive) {
+      const res = UrlFetchApp.fetch(`${this.fileGet}&fields=mimeType%2Csize`, {
+        headers: { authorization: this.authorization },
+      });
+      const obj = JSON.parse(res.getContentText());
+      if (obj.mimeType.includes("application/vnd.google-apps")) {
+        throw new Error("This script cannot be used for Google Workspace files (Docs, Sheets, etc.).");
+      }
+      this.tempObject.orgObject.source.mimeType = obj.mimeType;
+      this.tempObject.orgObject.source.size = obj.size;
+      return;
+    }
+    const res = UrlFetchApp.fetch(this.downloadUrl, {
+      muteHttpExceptions: true,
+      headers: { Range: "bytes=0-1" },
+    });
+    if (res.getResponseCode() != 206) {
+      throw new Error("This file download does not support partial requests (Range header).");
+    }
+    const headers = res.getHeaders();
+    const range = headers["Content-Range"].split("/");
+    this.tempObject.orgObject.source.mimeType = headers["Content-Type"].split(";")[0];
+    this.tempObject.orgObject.source.size = Number(range[1]);
+  }
+
+  getChunks_() {
+    const chunks = [...Array(Math.ceil(this.tempObject.orgObject.source.size / this.chunkSize))].map((_, i, a) => [
+      i * this.chunkSize,
+      i == a.length - 1 ? this.tempObject.orgObject.source.size - 1 : (i + 1) * this.chunkSize - 1,
+    ]);
+    this.tempObject.chunks = chunks;
+  }
+
+  getLocation_() {
+    const options = {
+      payload: JSON.stringify(this.tempObject.orgObject.destination.metadata),
+      contentType: "application/json",
+      muteHttpExceptions: true,
+    };
+    if (!this.tempObject.orgObject.destination.uploadUrl.includes("key=")) {
+      options.headers = { authorization: this.authorization };
+    }
+    const res = UrlFetchApp.fetch(this.tempObject.orgObject.destination.uploadUrl, options);
+    if (res.getResponseCode() != 200) throw new Error(res.getContentText());
+    this.tempObject.location = res.getAllHeaders()["Location"];
+  }
+
+  downloadAndUpload_() {
+    let res1 = [];
+    const len = this.tempObject.chunks.length;
+    for (let i = this.current; i < len; i++) {
+      const e = this.tempObject.chunks[i];
+      const currentBytes = `${e[0]}-${e[1]}`;
+      const params1 = {
+        headers: { range: `bytes=${currentBytes}` },
+        muteHttpExceptions: true,
+      };
+      if (this.googleDrive) params1.headers.authorization = this.authorization;
+      
+      res1 = UrlFetchApp.fetch(this.downloadUrl, params1).getContent();
+      
+      const params2 = {
+        headers: { "Content-Range": `bytes ${currentBytes}/${this.tempObject.orgObject.source.size}` },
+        payload: res1,
+        muteHttpExceptions: true,
+      };
+      const res2 = UrlFetchApp.fetch(this.tempObject.location, params2);
+      const statusCode = res2.getResponseCode();
+      
+      if (statusCode == 200) {
+        this.tempObject.result = JSON.parse(res2.getContentText());
+      } else if (statusCode != 308) {
+        throw new Error(res2.getContentText());
+      }
+      
+      if (Date.now() - this.startTime > this.limitProcessTime) {
+        this.tempObject.next = i + 1;
+        this.property.setProperty("next", JSON.stringify(this.tempObject));
+        break;
+      }
+    }
+    if (this.tempObject.next > 0 && !this.tempObject.result) {
+      const message = "Upload paused due to time limit. Run 'startUpload()' again to resume.";
+      this.tempObject.result = { message };
+    } else {
+      this.property.deleteProperty("next");
+    }
+  }
+}
